@@ -3,22 +3,40 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use wasmtime::{
     Engine, Linker, Module, Store,
     OptLevel, Strategy,
     Config,
 };
 use tokio::task;
-use tracing::{debug, info, error};
+use tracing::{debug, info, error, warn};
 
+use crate::cache::{CacheKey, ExecutionCache};
 use crate::host_functions::HostFunctionRegistry;
 use crate::sandbox::SandboxConfig;
 use crate::types::{ExecuteResponse, Language, SandboxLimits};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupStats {
+    pub modules_loaded: usize,
+    pub warmup_duration: Duration,
+    pub preloaded_languages: Vec<Language>,
+    pub module_sizes: Vec<(Language, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct WarmupState {
+    is_prewarmed: bool,
+    start_time: Option<Instant>,
+    stats: Option<WarmupStats>,
+}
+
 #[derive(Clone)]
 struct WasmModuleCache {
     modules: Arc<Mutex<HashMap<Language, Module>>>,
+    module_sizes: Arc<Mutex<HashMap<Language, usize>>>,
     engine: Engine,
 }
 
@@ -26,6 +44,7 @@ impl WasmModuleCache {
     fn new(engine: Engine) -> Self {
         Self {
             modules: Arc::new(Mutex::new(HashMap::new())),
+            module_sizes: Arc::new(Mutex::new(HashMap::new())),
             engine,
         }
     }
@@ -38,9 +57,33 @@ impl WasmModuleCache {
         }
 
         let module = self.create_stub_module(language)?;
+        let module_size = module.serialized_size().unwrap_or(0);
         modules.insert(language, module.clone());
+        self.module_sizes.lock().insert(language, module_size);
 
         Ok(module)
+    }
+
+    fn preload_all(&self) -> Result<Vec<(Language, usize)>> {
+        let languages = [Language::Python, Language::JavaScript, Language::Ruby];
+        let mut sizes = Vec::new();
+
+        for lang in languages.iter() {
+            let module = self.get_or_load(*lang)?;
+            let size = module.serialized_size().unwrap_or(0);
+            sizes.push((*lang, size));
+            debug!("Preloaded Wasm module for {:?} ({} bytes)", lang, size);
+        }
+
+        Ok(sizes)
+    }
+
+    fn is_preloaded(&self, language: Language) -> bool {
+        self.modules.lock().contains_key(&language)
+    }
+
+    fn get_module_size(&self, language: Language) -> Option<usize> {
+        self.module_sizes.lock().get(&language).copied()
     }
 
     fn create_stub_module(&self, language: Language) -> Result<Module> {
@@ -60,6 +103,7 @@ pub struct WasmRuntimeManager {
     module_cache: WasmModuleCache,
     host_functions: Arc<HostFunctionRegistry>,
     sandbox_config: SandboxConfig,
+    warmup_state: Arc<Mutex<WarmupState>>,
 }
 
 impl WasmRuntimeManager {
@@ -82,11 +126,18 @@ impl WasmRuntimeManager {
         let module_cache = WasmModuleCache::new(engine.clone());
         let host_functions = Arc::new(HostFunctionRegistry::new());
 
+        let warmup_state = Arc::new(Mutex::new(WarmupState {
+            is_prewarmed: false,
+            start_time: None,
+            stats: None,
+        }));
+
         Self {
             engine,
             module_cache,
             host_functions,
             sandbox_config,
+            warmup_state,
         }
     }
 
@@ -106,12 +157,107 @@ impl WasmRuntimeManager {
         let module_cache = WasmModuleCache::new(engine.clone());
         let host_functions = Arc::new(HostFunctionRegistry::new());
 
+        let warmup_state = Arc::new(Mutex::new(WarmupState {
+            is_prewarmed: false,
+            start_time: None,
+            stats: None,
+        }));
+
         Ok(Self {
             engine,
             module_cache,
             host_functions,
             sandbox_config,
+            warmup_state,
         })
+    }
+
+    pub async fn preload_all_modules(&mut self) -> Result<WarmupStats> {
+        info!("Starting Wasm module preload for all languages...");
+        let warmup_start = Instant::now();
+
+        {
+            let mut warmup_state = self.warmup_state.lock();
+            warmup_state.start_time = Some(warmup_start);
+        }
+
+        let module_sizes = task::spawn_blocking({
+            let module_cache = self.module_cache.clone();
+            move || module_cache.preload_all()
+        })
+        .await
+        .map_err(|e| anyhow!("Preload task join error: {}", e))??;
+
+        let languages: Vec<Language> = module_sizes.iter().map(|(l, _)| *l).collect();
+        let warmup_duration = warmup_start.elapsed();
+
+        let stats = WarmupStats {
+            modules_loaded: module_sizes.len(),
+            warmup_duration,
+            preloaded_languages: languages,
+            module_sizes: module_sizes.clone(),
+        };
+
+        {
+            let mut warmup_state = self.warmup_state.lock();
+            warmup_state.is_prewarmed = true;
+            warmup_state.stats = Some(stats.clone());
+        }
+
+        info!(
+            "Preload complete: {} modules loaded in {:?}",
+            stats.modules_loaded, stats.warmup_duration
+        );
+
+        for (lang, size) in &module_sizes {
+            debug!("  {:?}: {} bytes", lang, size);
+        }
+
+        Ok(stats)
+    }
+
+    pub fn get_warmup_stats(&self) -> Option<WarmupStats> {
+        self.warmup_state.lock().stats.clone()
+    }
+
+    pub fn is_prewarmed(&self) -> bool {
+        self.warmup_state.lock().is_prewarmed
+    }
+
+    pub async fn execute_code_with_cache(
+        &self,
+        language: Language,
+        code: &str,
+        timeout_ms: Option<u64>,
+        cache: Option<&ExecutionCache>,
+    ) -> Result<ExecuteResponse> {
+        if let Some(cache) = cache {
+            let cache_key = CacheKey::new(language, code, timeout_ms);
+
+            if let Some(cached) = cache.get(&cache_key) {
+                debug!("Cache hit for key: {}", cache_key.to_hash_string());
+                let mut response = cached;
+                response.execution_id = Uuid::new_v4();
+                response.cached = true;
+                return Ok(response);
+            }
+
+            debug!("Cache miss for key: {}", cache_key.to_hash_string());
+            let response = self.execute_code(language, code, timeout_ms).await?;
+
+            if response.success {
+                cache.insert(&cache_key, response.clone());
+            } else {
+                warn!(
+                    "Execution failed, not caching: {}",
+                    response.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+
+            Ok(response)
+        } else {
+            self.execute_code(language, code, timeout_ms).await
+        }
     }
 
     pub async fn execute_code(
@@ -192,6 +338,7 @@ impl WasmRuntimeManager {
             stderr,
             execution_time_ms,
             error,
+            cached: false,
         })
     }
 

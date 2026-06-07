@@ -7,11 +7,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, error};
+use tracing::{debug, info, error, warn};
 
 use crate::AppState;
+use crate::cache::CacheStats;
 use crate::types::{ExecuteRequest, ExecuteResponse, StatsResponse};
+use crate::wasm_runtime::WarmupStats;
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
@@ -19,7 +22,22 @@ pub fn create_router(state: AppState) -> Router {
         .route("/stats", get(stats_handler))
         .route("/health", get(health_handler))
         .route("/functions", get(functions_handler))
+        .route("/cache/stats", get(cache_stats_handler))
+        .route("/cache/clear", post(cache_clear_handler))
+        .route("/warmup/stats", get(warmup_stats_handler))
         .with_state(state)
+}
+
+#[derive(Debug, Serialize)]
+struct CacheClearResponse {
+    cleared: usize,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WarmupStatsResponse {
+    is_prewarmed: bool,
+    stats: Option<WarmupStats>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,10 +75,26 @@ async fn execute_handler(
             .into_response();
     }
 
+    let use_cache = request
+        .use_cache
+        .unwrap_or(true);
+
     let runtime_manager = state.runtime_manager.lock().await;
-    let result = runtime_manager
-        .execute_code(request.language, &request.code, request.timeout_ms)
-        .await;
+
+    let result = if use_cache {
+        runtime_manager
+            .execute_code_with_cache(
+                request.language,
+                &request.code,
+                request.timeout_ms,
+                Some(&state.execution_cache),
+            )
+            .await
+    } else {
+        runtime_manager
+            .execute_code(request.language, &request.code, request.timeout_ms)
+            .await
+    };
 
     match result {
         Ok(response) => {
@@ -82,8 +116,8 @@ async fn execute_handler(
             }
 
             info!(
-                "Execution completed: id={}, success={}, time={}ms",
-                response.execution_id, response.success, response.execution_time_ms
+                "Execution completed: id={}, success={}, time={}ms, cached={}",
+                response.execution_id, response.success, response.execution_time_ms, response.cached
             );
 
             (StatusCode::OK, Json(response)).into_response()
@@ -99,6 +133,36 @@ async fn execute_handler(
                 .into_response()
         }
     }
+}
+
+async fn cache_stats_handler(State(state): State<AppState>) -> Response {
+    debug!("Received cache stats request");
+    let stats = state.execution_cache.stats();
+    (StatusCode::OK, Json(stats)).into_response()
+}
+
+async fn cache_clear_handler(State(state): State<AppState>) -> Response {
+    debug!("Received cache clear request");
+    let cleared = state.execution_cache.clear();
+    info!("Cache cleared: {} entries", cleared);
+    (
+        StatusCode::OK,
+        Json(CacheClearResponse {
+            cleared,
+            message: "Cache cleared successfully".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn warmup_stats_handler(State(state): State<AppState>) -> Response {
+    debug!("Received warmup stats request");
+    let runtime_manager = state.runtime_manager.lock().await;
+    let response = WarmupStatsResponse {
+        is_prewarmed: runtime_manager.is_prewarmed(),
+        stats: runtime_manager.get_warmup_stats(),
+    };
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn stats_handler(State(state): State<AppState>) -> Response {
@@ -171,10 +235,12 @@ mod tests {
         db.init().await.unwrap();
 
         let runtime_manager = Arc::new(Mutex::new(WasmRuntimeManager::new()));
+        let execution_cache = Arc::new(crate::cache::ExecutionCache::with_config(100, std::time::Duration::from_secs(60)));
 
         AppState {
             db,
             runtime_manager,
+            execution_cache,
         }
     }
 

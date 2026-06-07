@@ -43,9 +43,11 @@ pub struct ExecuteRequest {
     pub code: String,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub use_cache: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExecuteResponse {
     pub execution_id: Uuid,
     pub success: bool,
@@ -53,6 +55,8 @@ pub struct ExecuteResponse {
     pub stderr: String,
     pub execution_time_ms: u64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub cached: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
