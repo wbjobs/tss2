@@ -22,6 +22,11 @@ env/
 __pycache__/
 *.pyc
 
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
 # IDE
 .idea/
 .vscode/
@@ -32,3 +37,9 @@ __pycache__/
 # Env
 .env
 .env.local
+
+# Sandbox data
+/sandbox/
+executions.db
+*.sqlite
+*.sqlite3
