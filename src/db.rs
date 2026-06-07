@@ -69,6 +69,7 @@ impl Database {
         code: &str,
     ) -> Result<()> {
         let now: DateTime<Utc> = Utc::now();
+        let safe_execution_time = execution_time_ms.max(0) as i64;
 
         sqlx::query(
             r#"
@@ -83,7 +84,7 @@ impl Database {
         .bind(success)
         .bind(stdout)
         .bind(stderr)
-        .bind(execution_time_ms as i64)
+        .bind(safe_execution_time)
         .bind(error_message)
         .bind(code)
         .bind(now.to_rfc3339())
@@ -105,15 +106,15 @@ impl Database {
         .await?;
 
         let avg_time: Option<f64> = sqlx::query_scalar(
-            "SELECT AVG(execution_time_ms) FROM executions",
+            "SELECT AVG(MAX(execution_time_ms, 0)) FROM executions",
         )
         .fetch_one(&self.pool)
         .await?;
 
         let total_executions = total.unwrap_or(0) as u64;
         let successful_executions = successful.unwrap_or(0) as u64;
-        let failed_executions = total_executions - successful_executions;
-        let average_execution_time_ms = avg_time.unwrap_or(0.0);
+        let failed_executions = total_executions.saturating_sub(successful_executions);
+        let average_execution_time_ms = avg_time.unwrap_or(0.0).max(0.0);
 
         let by_language = self.get_language_stats().await?;
         let recent_executions = self.get_recent_executions(10).await?;
@@ -135,7 +136,7 @@ impl Database {
                 language,
                 COUNT(*) as count,
                 SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
-                AVG(execution_time_ms) as avg_time
+                AVG(MAX(execution_time_ms, 0)) as avg_time
             FROM executions
             GROUP BY language
             ORDER BY count DESC
@@ -147,11 +148,14 @@ impl Database {
         let mut stats = Vec::new();
         for (lang_str, count, success_count, avg_time) in rows {
             if let Some(language) = Language::from_str(&lang_str) {
+                let safe_count = (count as u64).max(0);
+                let safe_success_count = (success_count as u64).max(0);
+                let safe_avg_time = avg_time.max(0.0);
                 stats.push(LanguageStats {
                     language,
-                    count: count as u64,
-                    success_count: success_count as u64,
-                    average_time_ms: avg_time,
+                    count: safe_count,
+                    success_count: safe_success_count,
+                    average_time_ms: safe_avg_time,
                 });
             }
         }
@@ -200,13 +204,14 @@ impl Database {
                 Language::from_str(&lang_str),
                 DateTime::parse_from_rfc3339(&created_at_str),
             ) {
+                let safe_execution_time = (execution_time_ms.max(0)) as u64;
                 records.push(ExecutionRecord {
                     id,
                     language,
                     success,
                     stdout,
                     stderr,
-                    execution_time_ms: execution_time_ms as u64,
+                    execution_time_ms: safe_execution_time,
                     error_message,
                     created_at: created_at.with_timezone(&Utc),
                 });

@@ -128,7 +128,7 @@ impl WasmRuntimeManager {
             execution_id, language.as_str(), timeout
         );
 
-        let start_time = Instant::now();
+        let exec_start = Instant::now();
         let exec_dir = self
             .sandbox_config
             .prepare_sandbox_dir(&execution_id.to_string())
@@ -158,7 +158,11 @@ impl WasmRuntimeManager {
             )
             .await;
 
-        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        let exec_end = Instant::now();
+        let execution_time_ms = exec_end
+            .saturating_duration_since(exec_start)
+            .as_millis()
+            .saturating_add(0) as u64;
 
         self.sandbox_config
             .cleanup_sandbox_dir(&execution_id.to_string())

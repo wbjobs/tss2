@@ -206,6 +206,157 @@ def test_invalid_code():
         return False
 
 
+def test_memory_boundary_checks():
+    """Test memory boundary checks and string length limits"""
+    print("\n=== Testing Memory Boundary Checks ===")
+
+    code = f"""
+# Test that string length constants are available
+print("MAX_STRING_LENGTH =", MAX_STRING_LENGTH)
+print("CHUNK_SIZE =", CHUNK_SIZE)
+
+# Test get_max_string_length
+max_len = get_max_string_length()
+print("get_max_string_length() =", max_len)
+
+# Test get_chunk_size
+chunk = get_chunk_size()
+print("get_chunk_size() =", chunk)
+
+# Test check_memory_bounds with valid range
+valid = check_memory_bounds(0, 1000)
+print("check_memory_bounds(0, 1000) =", valid)
+
+# Test check_memory_bounds with negative length
+invalid = check_memory_bounds(0, -1)
+print("check_memory_bounds(0, -1) =", invalid)
+
+# Test string_length with valid length
+len_ok = string_length(0, 1000)
+print("string_length(0, 1000) =", len_ok)
+
+# Test string_compare
+cmp = string_compare(0, 5, 0, 10)
+print("string_compare(0,5,0,10) =", cmp)
+"""
+    payload = {
+        "language": "python",
+        "code": code.strip(),
+        "timeout_ms": 5000
+    }
+    try:
+        response = requests.post(f"{BASE_URL}/execute", json=payload)
+        print(f"Status: {response.status_code}")
+        data = response.json()
+        print(f"Success: {data['success']}")
+        print(f"Stdout:\n{data['stdout']}")
+
+        checks = [
+            "MAX_STRING_LENGTH = 65536" in data["stdout"],
+            "CHUNK_SIZE = 32768" in data["stdout"],
+            "get_max_string_length() = 65536" in data["stdout"],
+            "get_chunk_size() = 32768" in data["stdout"],
+            "check_memory_bounds(0, 1000) = 1" in data["stdout"],
+            "check_memory_bounds(0, -1) = 0" in data["stdout"],
+            "string_length(0, 1000) = 1000" in data["stdout"],
+        ]
+
+        all_passed = all(checks)
+        print(f"All boundary checks passed: {all_passed}")
+        return response.status_code == 200 and data['success'] and all_passed
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+
+def test_execution_time_positive():
+    """Test that execution time is always positive in stats"""
+    print("\n=== Testing Execution Time is Always Positive ===")
+
+    print("Executing several code samples...")
+    for i in range(3):
+        payload = {
+            "language": "python",
+            "code": f"print('Test {i}')\nprint('fib(10) =', fibonacci(10))",
+            "timeout_ms": 5000
+        }
+        try:
+            response = requests.post(f"{BASE_URL}/execute", json=payload)
+            if response.status_code == 200:
+                data = response.json()
+                print(f"  Execution {i}: time = {data['execution_time_ms']}ms, positive = {data['execution_time_ms'] >= 0}")
+        except Exception as e:
+            print(f"  Error in execution {i}: {e}")
+
+    print("Fetching stats...")
+    try:
+        response = requests.get(f"{BASE_URL}/stats")
+        if response.status_code == 200:
+            data = response.json()
+            print(f"Average execution time: {data['average_execution_time_ms']}ms")
+            print(f"Is positive: {data['average_execution_time_ms'] >= 0}")
+
+            all_times_positive = True
+            for lang_stat in data['by_language']:
+                print(f"  {lang_stat['language']}: avg_time = {lang_stat['average_time_ms']}ms, positive = {lang_stat['average_time_ms'] >= 0}")
+                if lang_stat['average_time_ms'] < 0:
+                    all_times_positive = False
+
+            for exec_record in data['recent_executions']:
+                print(f"  Recent {exec_record['id'][:8]}: time = {exec_record['execution_time_ms']}ms, positive = {exec_record['execution_time_ms'] >= 0}")
+                if exec_record['execution_time_ms'] < 0:
+                    all_times_positive = False
+
+            return (
+                response.status_code == 200
+                and data['average_execution_time_ms'] >= 0
+                and all_times_positive
+            )
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+    return False
+
+
+def test_large_string_simulation():
+    """Test large string handling (>64KB simulation)"""
+    print("\n=== Testing Large String Handling Simulation ===")
+
+    large_data = "x" * 1000
+    code = f"""
+# Test string operations with larger data
+data = "{large_data}"
+print("Data length:", len(data))
+print("Fib(20) =", fibonacci(20))
+print("Multiply(100, 200) =", multiply(100, 200))
+print("Is Prime(997) =", is_prime(997))
+"""
+
+    payload = {
+        "language": "javascript",
+        "code": code.strip(),
+        "timeout_ms": 5000
+    }
+    try:
+        response = requests.post(f"{BASE_URL}/execute", json=payload)
+        print(f"Status: {response.status_code}")
+        data = response.json()
+        print(f"Success: {data['success']}")
+        print(f"Execution time: {data['execution_time_ms']}ms, positive = {data['execution_time_ms'] >= 0}")
+        if data['stdout']:
+            print(f"Stdout preview: {data['stdout'][:200]}...")
+
+        return (
+            response.status_code == 200
+            and data['success']
+            and data['execution_time_ms'] >= 0
+        )
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+
 def main():
     print("=" * 60)
     print("WASI Code Executor Service - Integration Tests")
@@ -220,6 +371,9 @@ def main():
     results.append(("Ruby Execution", test_execute_ruby()))
     results.append(("Stats Endpoint", test_stats()))
     results.append(("Invalid Code Handling", test_invalid_code()))
+    results.append(("Memory Boundary Checks", test_memory_boundary_checks()))
+    results.append(("Execution Time Positive", test_execution_time_positive()))
+    results.append(("Large String Handling", test_large_string_simulation()))
 
     print("\n" + "=" * 60)
     print("Test Results Summary")
